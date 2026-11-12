@@ -1,168 +1,162 @@
-"""Unit tests for the defect list.  Run: pytest -q  (from repo root)."""
+"""P1 gate tests: normalization, whole-word matching, the label convention, and a
+left-padding check against the smoke tokenizer.
+
+Run: python -m pytest -q            (fast: only one test touches the HF hub)
+"""
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 
 import numpy as np
 import pytest
 
-sys.path.insert(0, ".")
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 import common  # noqa: E402
 
 
-# ---------------------------------------------------------------- label convention
-def test_label_convention_wrong_is_one():
-    """THE regression from the first draft: y must be 1 when WRONG, not when right."""
-    golds = ["sinclair lewis"]
-    assert common.make_label("Sinclair Lewis", golds) == 0      # correct -> 0
-    assert common.make_label("Ernest Hemingway", golds) == 1    # wrong   -> 1
-    assert common.make_label("", golds) == 1                    # empty   -> wrong
-    assert common.LABEL_CONVENTION if hasattr(common, "LABEL_CONVENTION") else True
+# --------------------------------------------------------------------- normalization
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ("Paris", "paris"),
+        ("  New  York, City ", "new york city"),
+        ("The City of London", "city of london"),           # articles removed
+        ("a/an/the", ""),                                   # only articles -> empty
+        ("Trump's  win!!", "trump s win"),                  # punctuation -> space
+        ("ratio of 19:69", "ratio of 19 69"),               # never spliced into 1969
+        ("THE THE", ""),
+        ("", ""),
+    ],
+)
+def test_normalize_answer(raw: str, expected: str) -> None:
+    assert common.normalize_answer(raw) == expected
 
 
-def test_label_convention_string_matches_config():
+def test_normalize_punctuation_becomes_space_not_deleted() -> None:
+    """Deleting punctuation would splice '19:69' -> '1969' and create false hits."""
+    assert common.normalize_answer("19:69") == "19 69"
+    assert common.is_match("ratio of 19:69", ["1969"]) is False
+
+
+# --------------------------------------------------------------------- whole-word span
+def test_one_does_not_match_1990() -> None:
+    """"1" must not match "1990": 1-char aliases are ignored AND boundaries are strict."""
+    assert common.is_match("1990", ["1"]) is False           # alias < 2 chars ignored
+    assert common.is_match("1", ["1990"]) is False           # answer too short to span
+    assert common.is_match("the year 1", ["1990"]) is False
+    assert common.is_match("1990", ["1990"]) is True
+    assert common.is_match("Apollo 11", ["11"]) is True      # 2-char alias, whole word
+    assert common.is_match("Apollo 11", ["1"]) is False
+
+
+def test_paris_matches_longer_answer_and_vice_versa() -> None:
+    assert common.is_match("The city of Paris", ["Paris"]) is True
+    assert common.is_match("Paris", ["The city of Paris"]) is True   # alias contains answer
+    assert common.is_match("Paris, France", ["France"]) is True
+    assert common.is_match("Palermo", ["Paris"]) is False
+    assert common.is_match("The Seine", ["see"]) is False            # no partial words
+
+
+def test_case_insensitive_matching() -> None:
+    assert common.is_match("PARIS", ["paris"]) is True
+    assert common.is_match("sinclair LEWIS", ["Sinclair Lewis"]) is True
+
+
+def test_short_aliases_and_empty_answers_are_ignored() -> None:
+    assert common.is_match("anything at all", ["a"]) is False
+    assert common.is_match("anything", ["", "  "]) is False
+    assert common.is_match("", ["paris"]) is False
+    assert common.is_match("   ", ["paris"]) is False
+    assert common.is_match("?", ["paris"]) is False     # normalizes to empty
+
+
+# --------------------------------------------------------------------- label convention
+def test_label_convention_matched_is_zero_wrong_is_one() -> None:
+    """y = 1 means WRONG (hallucination), y = 0 means correct. Never invert."""
+    assert common.label_from_match(True) == 0
+    assert common.label_from_match(False) == 1
+    assert common.make_label("Paris", ["Paris"]) == 0                # correct -> 0
+    assert common.make_label("Berlin", ["Paris"]) == 1               # wrong    -> 1
+    assert common.make_label("", ["Paris"]) == 1                     # empty    -> wrong
+    assert common.make_label("Samuel Clemens", ["Mark Twain"]) == 1  # paraphrase -> wrong
+
+
+def test_label_convention_string_in_config() -> None:
     import config
+
     assert "y = 1" in config.LABEL_CONVENTION and "WRONG" in config.LABEL_CONVENTION
+    assert "P(y=1)" in config.LABEL_CONVENTION
 
 
-# ---------------------------------------------------------------- matching rules
-def test_substring_pitfall_one_vs_1990():
-    """Plain substring would match '1' inside '1990'; whole-word must not."""
-    assert common.answer_matches_gold("1990", ["1"]) is False      # 1-char alias ignored
-    assert common.answer_matches_gold("1990", ["1990"]) is True
-    assert common.answer_matches_gold("the year 1", ["1990"]) is False
-    assert common.answer_matches_gold("Apollo 11 launched in 1969", ["1969"]) is True
-    assert common.answer_matches_gold("ratio of 19:69", ["1969"]) is False  # word boundary
-
-
-def test_normalize_strips_punctuation_so_colon_cannot_bridge():
-    # punctuation removal could splice "19:69" into "1969"; normalize must insert
-    # a space so whole-word matching still refuses the false hit.
-    assert common.normalize("ratio of 19:69") == "ratio of 19 69"
-    assert common.answer_matches_gold(common.normalize("19:69"), ["1969"]) is False
-
-
-def test_short_alias_does_not_match_everything():
-    assert common.answer_matches_gold("anything at all", ["a"]) is False
-    assert common.answer_matches_gold("Paris", ["paris"]) is True
-    assert common.answer_matches_gold("Paris, France", ["france"]) is True
-    assert common.answer_matches_gold("The Seine", ["see"]) is False  # no partial word
-
-
-def test_normalize():
-    assert common.normalize("  New  York, City ") == "new york city"
-
-
-# ---------------------------------------------------------------- gold extraction
-def test_triviaqa_golds_use_normalized_aliases():
-    field = {"aliases": ["A B"], "normalized_aliases": ["a b", "c d"]}
-    assert common.golds_for("triviaqa", field) == ["a b", "c d"]
-
-
-def test_nqopen_golds_are_plain_list_of_strings():
-    """NQ-Open has NO answer.aliases; the field is list[str] (verified live)."""
-    assert common.golds_for("nq_open", ["Fernie Alpine Resort"]) == ["fernie alpine resort"]
-    with pytest.raises(AssertionError):
-        common.golds_for("nq_open", {"aliases": ["wrong shape"]})
-
-
-# ---------------------------------------------------------------- EOS masking
-def test_first_eos_position_and_decode_mask_padding():
+def test_build_prompt_contains_question_not_answer() -> None:
     class FakeTok:
-        def decode(self, ids, skip_special_tokens=True):
-            return " ".join(f"t{i}" for i in ids)
-    gen = [5, 7, 0, 0, 0]          # tokens after the first EOS (id 0) are padding
-    assert common.first_eos_position(np.asarray(gen), eos_id=0) == 2
-    assert common.decode_answer(FakeTok(), gen, eos_id=0) == "t5 t7"
-    # mean over real tokens only (what generate_and_score does):
-    vals = np.array([-0.5, -0.25, -9.0, -9.0, -9.0])
-    n = common.first_eos_position(np.asarray(gen), 0)
-    assert abs(vals[:n].mean() - (-0.375)) < 1e-9   # NOT contaminated by -9's
+        def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True):
+            assert tokenize is False and add_generation_prompt is True
+            return "\n".join(m["content"] for m in messages)
+
+    p = common.build_prompt(FakeTok(), "Capital of France?")
+    assert "Capital of France?" in p
+    assert "short factual answer" in p          # system prompt is included
+    assert "Paris" not in p                     # answers never enter the prompt
 
 
-# ---------------------------------------------------------------- metrics helpers
-def test_auroc_orientation_confidence_flip():
+def test_jsonl_roundtrip(tmp_path: Path) -> None:
+    rows = [{"id": "a/1", "question": "Q?", "gold_answers": ["x", "y"]}]
+    p = tmp_path / "r.jsonl"
+    assert common.save_jsonl(rows, p) == 1
+    assert common.load_jsonl(p) == rows
+    with pytest.raises(FileNotFoundError):
+        common.load_jsonl(tmp_path / "missing.jsonl")
+
+
+def test_metrics_helpers_orientation() -> None:
     y = np.array([0, 0, 1, 1])
-    conf = np.array([0.9, 0.8, 0.2, 0.1])           # higher conf = more likely correct
-    assert common.auroc(y, -conf) == pytest.approx(1.0)
+    risk = np.array([0.1, 0.2, 0.8, 0.9])       # risk = P(y=1): higher => worse
+    assert common.auroc(y, risk) == pytest.approx(1.0)
+    thr = common.calibrate_threshold_for_coverage(risk, 0.5)
+    at = common.accuracy_at_threshold(y, risk, thr)
+    assert at["realised_coverage"] == pytest.approx(0.5)
+    assert at["accuracy_answered"] == pytest.approx(1.0)
+    curve = common.coverage_accuracy_curve(y, risk, coverages=[0.5, 1.0])
+    assert curve["0.50"]["accuracy_answered"] >= curve["1.00"]["accuracy_answered"]
+    mean, lo, hi = common.bootstrap_ci(np.r_[np.ones(40), np.zeros(10)], 200, 42)
+    assert lo <= mean <= hi and mean == pytest.approx(0.8)
 
 
-def test_coverage_curve_monotone_and_threshold_calibration():
-    rng = np.random.default_rng(0)
-    y = (rng.random(1000) < 0.3).astype(np.int8)
-    p = np.where(y == 1, rng.beta(3, 2, 1000), rng.beta(2, 6, 1000))
-    thr = common.calibrate_threshold_for_coverage(y, p, 0.7)
-    at = common.accuracy_at_threshold(y, p, thr)
-    assert 0.65 <= at["realised_coverage"] <= 0.75
-    curve = common.coverage_accuracy_curve(y, p, coverages=(0.5, 0.7))
-    assert curve["0.50"]["accuracy_answered"] >= curve["0.70"]["accuracy_answered"] * 0.99
+# --------------------------------------------------------------------- left padding
+SMOKE_MODEL_ID = "Qwen/Qwen2.5-0.5B-Instruct"   # verified to exist on the Hub
 
 
-def test_bootstrap_ci_brackets_mean():
-    v = np.ones(50); v[:10] = 0
-    m, lo, hi = common.bootstrap_ci(v, 300, 1)
-    assert lo <= m <= hi and 0.8 == pytest.approx(m)
+def test_left_padding_last_position_is_real_token() -> None:
+    """Batch two prompts of very different length; position -1 must be the final REAL
+    token for both rows (attention_mask[:, -1] all ones) -- that is what makes
+    hidden_states[l][:, -1, :] the last-prompt-token activation for every row."""
+    from transformers import AutoTokenizer
 
+    tok = AutoTokenizer.from_pretrained(SMOKE_MODEL_ID)
+    tok.padding_side = "left"
+    if tok.pad_token is None:                    # verified: Qwen2.5 HAS a pad token
+        tok.pad_token = tok.eos_token
+    assert tok.pad_token is not None
 
-# ---------------------------------------------------------------- app gate P8
-def test_abstain_branch_never_calls_generate(tmp_path, monkeypatch):
-    """Gate P8: on the abstain path model.generate must be provably untouched."""
-    import joblib
-    from sklearn.linear_model import LogisticRegression
+    short = common.build_prompt(tok, "Capital of France?")
+    long = common.build_prompt(
+        tok,
+        "In the 19th century, which composer from Bohemia wrote a symphony that is "
+        "commonly associated with the discovery of a new continent, and what was its "
+        "nickname in English-speaking countries?",
+    )
+    enc = tok([short, long], return_tensors="pt", padding=True)
+    ids, am = enc["input_ids"], enc["attention_mask"]
 
-    # --- fake everything; app.py imports torch/config lazily inside functions
-    d = 4
-    X = np.concatenate([np.zeros((20, d)), np.ones((20, d))])
-    yw = np.array([0] * 20 + [1] * 20)
-    clf = LogisticRegression().fit(X, yw)
-    bundle = {"probe": clf, "layer": 0, "C": 1.0}
-    joblib.dump(bundle, tmp_path / "probe.joblib")
-    import json
-    (tmp_path / "metrics.json").write_text(json.dumps({"threshold_p_wrong": 0.01}))
-
-    calls = {"generate": 0}
-
-    class FakeOut:
-        class _HS:
-            def __getitem__(self, li):
-                class Row:
-                    def __getitem__(self, sl):
-                        class T:
-                            def float(self): return self
-                            def cpu(self): return self
-                            def numpy(self): return np.ones((1, d)) * 10.0  # screams WRONG
-                        return T()
-                return Row()
-        hidden_states = _HS()
-
-    class FakeModel:
-        def __call__(self, **kw): return FakeOut()
-        def generate(self, *a, **k):
-            calls["generate"] += 1
-            raise AssertionError("generate called on abstain path!")
-
-    class FakeTokEnc(dict):
-        def to(self, device): return self
-
-    class FakeTok:
-        def apply_chat_template(self, msgs, tokenize=False, add_generation_prompt=True):
-            return "PROMPT"
-        def __call__(self, texts, return_tensors=None, padding=None):
-            return FakeTokEnc()
-
-    import config as cfgmod
-    monkeypatch.setattr(cfgmod, "PROBE_PATH", str(tmp_path / "probe.joblib"))
-    monkeypatch.setattr(cfgmod, "METRICS_PATH", str(tmp_path / "metrics.json"))
-    monkeypatch.setattr(cfgmod, "resolve_device", lambda r=None: "cpu")
-
-    import common as cmod
-    monkeypatch.setattr(cmod, "load_model_and_tokenizer",
-                        lambda mid, dev, dt: (FakeModel(), FakeTok(), "fp32"))
-
-    import importlib
-    import app
-    importlib.reload(app)
-    app._ready = False
-    out = app.answer("What nonsense question is this?")
-    assert "abstained" in out.lower()
-    assert calls["generate"] == 0
+    assert ids.shape[0] == 2 and int(am.sum(-1).min()) < int(am.sum(-1).max())
+    assert bool(am[:, -1].all()), "position -1 must be unmasked under left padding"
+    # the shorter row really was padded on the LEFT
+    assert int(am[0].argmax()) > 0
+    # and each row's last token equals its unpadded encoding's last token
+    solo_l = tok(long, return_tensors="pt")["input_ids"][0]
+    solo_s = tok(short, return_tensors="pt")["input_ids"][0]
+    assert int(ids[1, -1]) == int(solo_l[-1])
+    assert int(ids[0, -1]) == int(solo_s[-1])
