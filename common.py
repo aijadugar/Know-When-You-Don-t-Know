@@ -1,297 +1,297 @@
-"""Shared utilities: normalization/matching, labeling, prompting, generation,
-logit-based baselines, activation extraction, AUROC and bootstrap CIs.
+"""Shared, GPU-free-at-import helpers for the abstention pipeline.
 
-Design rules baked in (each corresponds to a defect found in the first draft):
-  * y = 1 means WRONG (matches no gold alias).  See LABEL_CONVENTION.
-  * Whole-word matching with a minimum alias length -- plain substring would let
-    "1" match "1990" and short answers match everything.
-  * TriviaQA golds come from answer.normalized_aliases; NQ-Open golds are a plain
-    list of strings (NOT answer.aliases).
-  * Prompts go through apply_chat_template(..., tokenize=False,
-    add_generation_prompt=True) and are THEN tokenized as strings -- chat-template
-    dicts passed straight to the tokenizer crash or build the wrong prompt.
-  * Left padding; generated text is sliced at input_ids.shape[1] (attention_mask
-    sums break under left padding).
-  * Baseline scores are computed over REAL tokens only: positions after the first
-    EOS are masked out so padding can't bias them by answer length.
-  * Activations come from output_hidden_states=True, index -1 on the sequence axis
-    (the last prompt token), never from per-layer forward hooks.
+Importing this module must stay cheap (no torch/transformers at module top level)
+so `pytest` runs in seconds; anything that needs a model lives in a function-local
+import inside the stage scripts.
+
+Conventions baked in here (they are the contract every stage relies on):
+  * LABEL: y = 1 means the model's greedy answer is WRONG, y = 0 correct.
+    The probe's risk score is P(y=1).  See config.LABEL_CONVENTION -- never invert.
+  * PROMPT: build_prompt() renders [system, user] through
+    apply_chat_template(messages, tokenize=False, add_generation_prompt=True).
+    The prompt contains the QUESTION ONLY, never the answer or the gold aliases.
+  * PADDING: tokenizer padding_side="left", so position -1 of input_ids is the last
+    REAL prompt token for every row and generated text starts at
+    input_ids.shape[1] for every row of the batch.
+  * MATCHING: whole-word span matching after normalize_answer(); see its docstring
+    for the two known failure modes (valid paraphrases -> labelled wrong; very
+    short gold answers -> matched strictly).
 """
 from __future__ import annotations
 
 import json
-import os
+import random
 import re
 import string
-from typing import Iterable, Sequence
+from pathlib import Path
+from typing import Any, Iterable, Sequence
 
 import numpy as np
 
-MIN_ALIAS_LEN = 2  # normalized aliases shorter than this are dropped from matching
+MIN_ALIAS_LEN = 2          # normalized aliases shorter than this are ignored
+_EXTRA_PUNCT = "\u201c\u201d\u2018\u2019\u2013\u2014\u2026"   # “ ” ‘ ’ – — …
+_PUNCT_TABLE = str.maketrans(string.punctuation + _EXTRA_PUNCT,
+                             " " * (len(string.punctuation) + len(_EXTRA_PUNCT)))
+_ARTICLES = {"a", "an", "the"}
+
+
+# --------------------------------------------------------------------------- seeds
+def set_seed(seed: int) -> None:
+    """Delegate to config.set_seed (python/numpy/torch/dataset shuffles all use it)."""
+    from config import set_seed as _set_seed
+
+    _set_seed(seed)
+
 
 # --------------------------------------------------------------------------- jsonl
-def read_jsonl(path: str) -> list[dict]:
-    with open(path, encoding="utf-8") as f:
-        return [json.loads(line) for line in f if line.strip()]
+def load_jsonl(path: str | Path) -> list[dict]:
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(
+            f"{p} not found. Run the earlier pipeline stage first "
+            f"(see Makefile targets), e.g. `make data`."
+        )
+    rows: list[dict] = []
+    with p.open(encoding="utf-8") as f:
+        for i, line in enumerate(f, 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError as e:  # loud, with the offending line
+                raise ValueError(f"{p}:{i} is not valid JSON: {e}\n  {line[:200]}") from e
+    return rows
 
 
-def write_jsonl(path: str, rows: Iterable[dict]) -> None:
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
+def save_jsonl(rows: Iterable[dict], path: str | Path) -> int:
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    n = 0
+    with p.open("w", encoding="utf-8") as f:
         for r in rows:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
+            n += 1
+    return n
 
 
-# --------------------------------------------------------------------------- matching
-def normalize(s: str) -> str:
-    """TriviaQA-style normalization: lowercase, punctuation becomes a SPACE (not
-    deleted -- deleting would splice '19:69' into '1969' and create false hits),
-    whitespace collapsed."""
-    s = s.lower()
-    s = s.translate(str.maketrans(string.punctuation, " " * len(string.punctuation)))
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
+def append_jsonl(rows: Iterable[dict], path: str | Path) -> int:
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    n = 0
+    with p.open("a", encoding="utf-8") as f:
+        for r in rows:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+            n += 1
+    return n
 
 
-def _wordwise_regex(alias_norm: str) -> re.Pattern:
-    # whole-word match: \b boundaries so "1" does not match "1990"
-    esc = re.escape(alias_norm)
-    return re.compile(rf"(?<!\w){esc}(?!\w)")
+def count_lines(path: str | Path) -> int:
+    p = Path(path)
+    if not p.exists():
+        return 0
+    with p.open(encoding="utf-8") as f:
+        return sum(1 for line in f if line.strip())
 
 
-def answer_matches_gold(answer: str, golds_norm: Sequence[str]) -> bool:
-    """True iff `answer` contains any gold alias as a whole word.
+# --------------------------------------------------------------------------- prompt
+def build_prompt(tokenizer: Any, question: str) -> str:
+    """Render the chat prompt (system + question) as TEXT.
 
-    golds_norm must already be normalized(); aliases shorter than MIN_ALIAS_LEN
-    are ignored (a 1-char alias matches too much to be trusted).
+    Verified API (transformers==4.53.2):
+      tokenizer.apply_chat_template(messages, tokenize=False,
+                                    add_generation_prompt=True) -> str
+    The system prompt comes from config.SYSTEM_PROMPT; the answer/golds are NOT
+    part of the prompt, so activations at the last prompt token cannot leak them.
     """
-    a = normalize(answer)
-    if not a:
-        return False
-    for g in golds_norm:
-        if len(g) < MIN_ALIAS_LEN:
-            continue
-        if _wordwise_regex(g).search(a):
-            return True
-    return False
+    from config import SYSTEM_PROMPT
 
-
-def make_label(answer: str, golds_norm: Sequence[str]) -> int:
-    """LABEL CONVENTION: y = 1 when the answer matches NO gold alias (WRONG)."""
-    return 0 if answer_matches_gold(answer, golds_norm) else 1
-
-
-def golds_for(row_kind: str, answer_field) -> list[str]:
-    """Extract normalized gold aliases.
-
-    row_kind == 'triviaqa': answer_field is the HF dict with aliases /
-        normalized_aliases (use normalized_aliases; fall back to aliases).
-    row_kind == 'nq_open': answer_field is a LIST OF STRINGS (verified field
-        layout); there is no .aliases attribute.
-    """
-    if row_kind == "triviaqa":
-        gl = answer_field.get("normalized_aliases") or []
-        if not gl:
-            gl = answer_field.get("aliases") or []
-    elif row_kind == "nq_open":
-        assert isinstance(answer_field, list), type(answer_field)
-        gl = answer_field
-    else:
-        raise ValueError(row_kind)
-    return sorted({normalize(g) for g in gl if normalize(g)})
-
-
-# --------------------------------------------------------------------------- model I/O
-def load_model_and_tokenizer(model_id: str, device: str, dtype_name: str | None):
-    import torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-
-    from config import pick_dtype
-
-    torch_dtype, used = (None, "fp32") if device == "cpu" else pick_dtype(device, dtype_name)
-    tok = AutoTokenizer.from_pretrained(model_id, padding_side="left")
-    if tok.pad_token is None:
-        tok.pad_token = tok.eos_token
-    model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch_dtype)
-    model.to(device)
-    model.eval()
-    print(f"[common] model={model_id} device={device} dtype={used}")
-    return model, tok, used
-
-
-def build_prompt(question: str, tokenizer) -> str:
-    """Chat template applied to a message DICT but rendered to TEXT
-    (tokenize=False, add_generation_prompt=True); we tokenize the string later."""
-    messages = [{"role": "user", "content": question}]
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": question},
+    ]
     return tokenizer.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True
     )
 
 
-def first_eos_position(gen_ids: np.ndarray, eos_id: int) -> int:
-    """Index of the first EOS in generated ids, or len(gen_ids)."""
-    hits = np.flatnonzero(np.asarray(gen_ids) == eos_id)
-    return int(hits[0]) if hits.size else int(len(gen_ids))
+# --------------------------------------------------------------------------- model I/O
+def load_model_and_tokenizer(model_id: str, device: str | None = None):
+    """Return (model, tokenizer, dtype_name).
 
-
-def decode_answer(tokenizer, gen_ids: Sequence[int], eos_id: int) -> str:
-    """Decode generated ids up to (excluding) the FIRST EOS.
-
-    Caller passes only the continuation ids, i.e. out_ids[:, input_ids.shape[1]:]
-    -- under left padding attention_mask.sum() would cut the wrong position.
-    """
-    real = list(gen_ids[: first_eos_position(np.asarray(gen_ids), eos_id)])
-    if not real:
-        return ""
-    return tokenizer.decode(real, skip_special_tokens=True).strip()
-
-
-# --------------------------------------------------------------------------- generation + baselines
-def generate_and_score(model, tokenizer, prompts: Sequence[str], device: str,
-                       max_new_tokens: int, batch_size: int):
-    """Greedy-generate answers for `prompts` and compute, per row:
-
-      answers        decoded text (stops at first EOS)
-      mean_logprob   baseline (a): MEAN LOG-PROB of the CHOSEN token over real
-                     generated tokens only (positions after the first EOS masked;
-                     padding never averaged in)
-      first_maxprob  baseline (b): MAX SOFTMAX PROB of the first generated token
-      gen_ids        raw continuation ids [N, T]
-
-    Returns dict of lists/arrays.  Scores are oriented so that HIGHER = more
-    confident; AUROC is computed against y with sign flip handled by the caller.
+    * dtype: bfloat16 if torch.cuda.is_bf16_supported() else float16 on CUDA,
+      float32 on CPU (config.pick_dtype); the chosen name is printed (rule 5).
+    * model: eval(), no grad needed by callers, moved to `device` when CUDA exists.
+    * tokenizer: padding_side="left"; pad token verified before touching it --
+      Qwen2.5 ships pad_token=<|padding|> (id 151643), so pad=eos is a fallback
+      that only fires if a future checkpoint drops it.
     """
     import torch
-    import torch.nn.functional as F
+    from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    eos_id = tokenizer.eos_token_id
-    pad_id = tokenizer.pad_token_id
-    answers, mean_logs, first_maxs, all_ids = [], [], [], []
+    from config import pick_dtype, resolve_device
 
-    for i in range(0, len(prompts), batch_size):
-        chunk = list(prompts[i : i + batch_size])
-        enc = tokenizer(chunk, return_tensors="pt", padding=True).to(device)
-        in_len = enc["input_ids"].shape[1]  # slice point under LEFT padding
-        with torch.no_grad():
-            out = model.generate(
-                **enc,
-                max_new_tokens=max_new_tokens,
-                do_sample=False,
-                pad_token_id=pad_id,
-                return_dict_in_generate=True,
-                output_scores=True,
-            )
-        gen = out.sequences[:, in_len:]                      # [B, T]
-        T = gen.shape[1]
-        # stack per-step logits -> log-softmax -> log-prob of chosen token
-        step_logits = torch.stack(out.scores, dim=1).float()  # [B, T, V]
-        step_logp = F.log_softmax(step_logits, dim=-1)
-        chosen = step_logp.gather(-1, gen.unsqueeze(-1)).squeeze(-1)  # [B, T]
-        probs = step_logp.exp()
-        maxp_first = probs[:, 0].max(dim=-1).values                 # [B]
+    dev = resolve_device(device)
+    dtype, dtype_name = pick_dtype()
+    if dev == "cpu":
+        dtype, dtype_name = torch.float32, "float32(cpu)"
 
-        for b in range(gen.shape[0]):
-            ids_b = gen[b].tolist()
-            n_real = first_eos_position(ids_b, eos_id)
-            n_real = max(n_real, 1)  # keep at least the first token
-            answers.append(decode_answer(tokenizer, ids_b, eos_id))
-            mean_logs.append(float(chosen[b, :n_real].mean()))
-            first_maxs.append(float(maxp_first[b]))
-            all_ids.append(ids_b)
-        del out, step_logits, step_logp, chosen, probs
-        if device == "cuda":
-            torch.cuda.empty_cache()
+    tok = AutoTokenizer.from_pretrained(model_id)
+    tok.padding_side = "left"
+    if tok.pad_token is None:
+        print(f"[common] WARNING: {model_id} has no pad token ({tok.pad_token!r}); "
+              f"falling back to eos={tok.eos_token!r}")
+        tok.pad_token = tok.eos_token
+    else:
+        print(f"[common] pad token OK: {tok.pad_token!r} (id={tok.pad_token_id}), "
+              f"eos={tok.eos_token!r} (id={tok.eos_token_id})")
 
-    maxlen = max(len(x) for x in all_ids) if all_ids else 0
-    ids_arr = np.full((len(all_ids), maxlen), pad_id, dtype=np.int64)
-    for b, x in enumerate(all_ids):
-        ids_arr[b, : len(x)] = x
-    return {
-        "answers": answers,
-        "mean_logprob": np.asarray(mean_logs, dtype=np.float64),
-        "first_maxprob": np.asarray(first_maxs, dtype=np.float64),
-        "gen_ids": ids_arr,
-    }
+    kwargs: dict[str, Any] = {}
+    if dev == "cuda":
+        kwargs["device_map"] = {"": 0}
+    model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=dtype, **kwargs)
+    if dev != "cuda":
+        model = model.to(dev)
+    model.eval()
+    for p_ in model.parameters():
+        p_.requires_grad_(False)
+    print(f"[common] model={model_id} device={dev} dtype={dtype_name} "
+          f"torch={torch.__version__}")
+    return model, tok, dtype_name
 
 
-# --------------------------------------------------------------------------- activations
-def extract_last_token_activations(model, tokenizer, prompts: Sequence[str],
-                                   device: str, batch_size: int) -> np.ndarray:
-    """Hidden state at the LAST PROMPT TOKEN for every layer, float16.
+# --------------------------------------------------------------------------- normalization
+def normalize_answer(text: str) -> str:
+    """lowercase -> punctuation to SPACES -> drop articles -> collapse whitespace.
 
-    output_hidden_states=True; hidden_states[l] is [B, L, d]; we take [:, -1, :]
-    which is the last prompt token because padding is on the LEFT.  No forward
-    hooks (fragile, easy to read the wrong tensor).  Result: [N, n_layers+1, d].
+    Punctuation becomes a space rather than being deleted on purpose: deleting it
+    would splice "19:69" into "1969" and create false matches.
     """
-    import torch
+    s = str(text).lower().translate(_PUNCT_TABLE)
+    toks = [t for t in s.split() if t not in _ARTICLES]
+    return " ".join(toks)
 
-    outs = []
-    for i in range(0, len(prompts), batch_size):
-        chunk = list(prompts[i : i + batch_size])
-        enc = tokenizer(chunk, return_tensors="pt", padding=True).to(device)
-        with torch.no_grad():
-            out = model(**enc, output_hidden_states=True, use_cache=False)
-        hs = torch.stack([h[:, -1, :] for h in out.hidden_states], dim=1)  # [B, L+1, d]
-        outs.append(hs.to(torch.float16).cpu().numpy())
-        del out, hs
-        if device == "cuda":
-            torch.cuda.empty_cache()
-    return np.concatenate(outs, axis=0)
+
+def _whole_word_span(haystack: str, needle: str) -> bool:
+    """True iff `needle` occurs in `haystack` delimited by non-word chars."""
+    if not needle:
+        return False
+    return re.search(rf"(?<!\w){re.escape(needle)}(?!\w)", haystack) is not None
+
+
+def is_match(answer: str, gold_aliases: Sequence[str]) -> bool:
+    """Whole-word match between the model answer and ANY gold alias, both sides
+    normalized.  Match counts when the answer contains an alias as a whole-word
+    span OR an alias contains the answer as a whole-word span.
+
+    Ignored on purpose: empty/whitespace answers (never match -> labelled wrong)
+    and aliases shorter than MIN_ALIAS_LEN=2 chars after normalization (a 1-char
+    alias such as "1" would otherwise match "1990").
+
+    KNOWN LIMITS (accepted, they define the label noise we report):
+      1. Valid paraphrases are labelled WRONG: gold "Mark Twain" vs answer
+         "Samuel Clemens" -> y=1 even though the model is right.
+      2. Very short gold answers are matched strictly: gold "7" vs answer
+         "Seven" -> y=1; conversely any 1-char alias is dropped entirely, so
+         gold ["A"] can never be matched and always yields y=1.
+    """
+    a = normalize_answer(answer)
+    if not a:
+        return False
+    for g in gold_aliases:
+        gn = normalize_answer(g)
+        if len(gn) < MIN_ALIAS_LEN:
+            continue
+        if gn == a or _whole_word_span(a, gn) or _whole_word_span(gn, a):
+            return True
+    return False
+
+
+def label_from_match(matched: bool) -> int:
+    """THE label convention: matched (correct) -> y=0; not matched (WRONG) -> y=1."""
+    return 0 if matched else 1
+
+
+def make_label(answer: str, gold_aliases: Sequence[str]) -> int:
+    """Convenience: is_match + label_from_match in one call."""
+    return label_from_match(is_match(answer, gold_aliases))
+
+
+def dedupe_keep_order(values: Iterable[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for v in values:
+        if v and v not in seen:
+            seen.add(v)
+            out.append(v)
+    return out
 
 
 # --------------------------------------------------------------------------- metrics
 def auroc(y: np.ndarray, score: np.ndarray) -> float:
+    """AUROC of `score` against y (y=1 wrong).  A risk score (higher => more likely
+    wrong) gives AUROC > 0.5; pass -confidence for the confidence baselines."""
     from sklearn.metrics import roc_auc_score
 
     y = np.asarray(y)
-    if len(set(y.tolist())) < 2:
+    if len(np.unique(y)) < 2:
         return float("nan")
     return float(roc_auc_score(y, np.asarray(score, dtype=np.float64)))
 
 
-def coverage_accuracy_curve(y: np.ndarray, p_wrong: np.ndarray, coverages=(0.5, 0.6, 0.7, 0.8)):
-    """Answer the top-(coverage fraction) most-confident-correct rows.
+def calibrate_threshold_for_coverage(p_wrong: np.ndarray, target: float) -> float:
+    """Threshold on P(y=1) answering ~`target` of the rows (ties break conservatively)."""
+    p = np.sort(np.asarray(p_wrong, dtype=np.float64))
+    k = max(1, int(round(target * len(p))))
+    return float(p[k - 1])
 
-    p_wrong = probe probability of y=1 (wrong).  Answer when p_wrong <= threshold.
-    Returns {coverage: {"realised_coverage", "accuracy_answered", "n_answered"}}.
-    """
-    y, p = np.asarray(y), np.asarray(p_wrong)
-    order = np.argsort(p)                    # least-likely-wrong first
+
+def accuracy_at_threshold(y: np.ndarray, p_wrong: np.ndarray, thr: float) -> dict:
+    y = np.asarray(y)
+    p = np.asarray(p_wrong, dtype=np.float64)
+    answered = p <= thr
+    n = int(answered.sum())
+    return {
+        "threshold_p_wrong": float(thr),
+        "realised_coverage": n / len(y) if len(y) else float("nan"),
+        "n_answered": n,
+        "n_abstained": int(len(y) - n),
+        "accuracy_answered": float((y[answered] == 0).mean()) if n else float("nan"),
+        "selective_error_rate": float((y[answered] == 1).mean()) if n else float("nan"),
+    }
+
+
+def coverage_accuracy_curve(y: np.ndarray, p_wrong: np.ndarray,
+                            coverages: Sequence[float]) -> dict:
+    """Answer the `coverage` fraction of rows with the LOWEST predicted risk."""
+    y = np.asarray(y)
+    order = np.argsort(np.asarray(p_wrong, dtype=np.float64), kind="stable")
     ys = y[order]
-    out = {}
+    out: dict[str, dict] = {}
     for c in coverages:
         k = max(1, int(round(c * len(y))))
-        acc = float((ys[:k] == 0).mean())
         out[f"{c:.2f}"] = {
-            "requested_coverage": c,
+            "requested_coverage": float(c),
             "realised_coverage": k / len(y),
-            "accuracy_answered": acc,
             "n_answered": k,
+            "accuracy_answered": float((ys[:k] == 0).mean()),
         }
     return out
 
 
-def bootstrap_ci(values: np.ndarray, n: int, seed: int, alpha: float = 0.05):
+def bootstrap_ci(values: np.ndarray, n_boot: int, seed: int,
+                 alpha: float = 0.05) -> tuple[float, float, float]:
     rng = np.random.default_rng(seed)
-    vals = np.asarray(values, dtype=np.float64)
-    boots = [vals[rng.integers(0, len(vals), len(vals))].mean() for _ in range(n)]
+    v = np.asarray(values, dtype=np.float64)
+    idx = rng.integers(0, len(v), size=(n_boot, len(v)))
+    boots = v[idx].mean(axis=1)
     lo, hi = np.percentile(boots, [100 * alpha / 2, 100 * (1 - alpha / 2)])
-    return float(vals.mean()), float(lo), float(hi)
+    return float(v.mean()), float(lo), float(hi)
 
 
-def accuracy_at_threshold(y: np.ndarray, p_wrong: np.ndarray, thr: float):
-    answer = p_wrong <= thr
-    na = int(answer.sum())
-    return {
-        "threshold": float(thr),
-        "realised_coverage": na / len(y) if len(y) else float("nan"),
-        "n_answered": na,
-        "accuracy_answered": float((np.asarray(y)[answer] == 0).mean()) if na else float("nan"),
-    }
-
-
-def calibrate_threshold_for_coverage(y: np.ndarray, p_wrong: np.ndarray, target: float) -> float:
-    """Threshold on p_wrong giving ~`target` coverage (ties broken conservatively)."""
-    p = np.sort(np.asarray(p_wrong))
-    k = max(1, int(round(target * len(p))))
-    return float(p[k - 1])
+def sample_rows(rows: Sequence[dict], k: int, seed: int) -> list[dict]:
+    """Deterministic random sample without replacement (seeded, rule 5)."""
+    if k >= len(rows):
+        return list(rows)
+    rng = random.Random(seed)
+    return rng.sample(list(rows), k)
