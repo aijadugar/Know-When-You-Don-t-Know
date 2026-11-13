@@ -1,3 +1,0 @@
-# Dev/test extras on top of requirements.txt.
--r requirements.txt
-pytest==9.2.0
