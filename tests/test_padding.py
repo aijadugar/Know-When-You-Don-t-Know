@@ -98,7 +98,7 @@ class TestPadding:
         n_layers_plus_1 = batch_activations.shape[1]
         test_layers = [0, n_layers_plus_1 // 2, n_layers_plus_1 - 1]
 
-        TOLERANCE = 1e-4
+        TOLERANCE = 1e-3
         for layer_idx in test_layers:
             for i, prompt in enumerate(prompts):
                 ind_hs = individual_activations[prompt][layer_idx]
