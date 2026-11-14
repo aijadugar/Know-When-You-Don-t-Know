@@ -386,9 +386,9 @@ def main():
     val_risk_b = 1.0 - val_ftmx
 
     # Thresholds at TARGET_COVERAGE percentile
-    threshold = float(np.percentile(val_probe_risk, (1 - TARGET_COVERAGE) * 100))
-    threshold_a = float(np.percentile(val_risk_a, (1 - TARGET_COVERAGE) * 100))
-    threshold_b = float(np.percentile(val_risk_b, (1 - TARGET_COVERAGE) * 100))
+    threshold = float(np.percentile(val_probe_risk, TARGET_COVERAGE * 100))
+    threshold_a = float(np.percentile(val_risk_a, TARGET_COVERAGE * 100))
+    threshold_b = float(np.percentile(val_risk_b, TARGET_COVERAGE * 100))
 
     realised_val_cov = float((val_probe_risk <= threshold).mean())
 
