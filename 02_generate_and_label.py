@@ -41,6 +41,7 @@ def decode_answer(
     input_ids: torch.Tensor,
     sequences: torch.Tensor,
     scores: list[torch.Tensor],
+    row: int = 0,
 ) -> tuple[str, float, float, int]:
     """Decode the generated answer and compute metrics.
     Returns: (answer_text, mean_logprob, first_token_maxprob, n_tokens)
@@ -65,23 +66,19 @@ def decode_answer(
 
     n_tokens = len(real_gen)
 
-    # Compute transition scores (log-probs of chosen tokens)
-    # scores is list of [batch, vocab] tensors, one per step
+    # scores: list (one per step) of [batch, vocab] logits. Use THIS row only.
     if scores and n_tokens > 0:
-        transition_scores = torch.stack(scores[:n_tokens], dim=0)  # [T, vocab]
-        # Get log-prob of the chosen token at each step
-        chosen_logprobs = transition_scores[range(len(real_gen)), real_gen]
-        # Mask: transition_scores are already log-probs (normalize_logits=True)
-        # mean over real tokens only
-        mean_logprob = chosen_logprobs.float().mean().item()
+        step_logits = torch.stack([s[row] for s in scores[:n_tokens]], dim=0).float()  # [T, vocab]
+        step_logprobs = torch.log_softmax(step_logits, dim=-1)
+        idx = torch.arange(n_tokens, device=step_logprobs.device)
+        chosen_logprobs = step_logprobs[idx, real_gen.to(step_logprobs.device)]
+        mean_logprob = chosen_logprobs.mean().item()
     else:
         mean_logprob = 0.0
 
-    # First-token max probability from softmax of first score vector
     if scores:
-        first_scores = scores[0].float()  # [batch, vocab]
-        probs = torch.softmax(first_scores, dim=-1)
-        first_token_maxprob = probs[0].max().item()
+        probs = torch.softmax(scores[0][row].float(), dim=-1)
+        first_token_maxprob = probs.max().item()
     else:
         first_token_maxprob = 0.0
 
@@ -183,6 +180,7 @@ def process_split(
                     input_ids[i : i + 1],
                     sequences[i : i + 1],
                     scores,
+                    row=i,
                 )
 
                 matched = is_match(answer, batch_rows[i]["gold_answers"])
@@ -235,6 +233,7 @@ def process_split(
                         sub_input_ids[j : j + 1],
                         sub_sequences[j : j + 1],
                         sub_scores,
+                        row=j,
                     )
 
                     matched = is_match(answer, sub_rows[j]["gold_answers"])
@@ -333,7 +332,10 @@ def main():
 
     # Load model
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    if not torch.cuda.is_available():
+        dtype = torch.float32  # float16 on CPU is extremely slow
+    else:
+        dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
     print(f"Device: {device}, dtype: {dtype}")
 
     model, tokenizer = load_model_and_tokenizer(model_id, dtype)
@@ -376,9 +378,20 @@ def main():
         status = "✓" if 0.2 <= wr <= 0.8 else "✗ FAIL"
         print(f"  {split_name}: wrong_rate={wr:.3f} {status}")
 
-    for split_name, wr in wrong_rates.items():
-        if not (0.2 <= wr <= 0.8):
-            print(f"\nWARNING: {split_name} wrong rate {wr:.3f} outside [0.2, 0.8]")
+    bad = [(s, wr) for s, wr in wrong_rates.items() if not (0.2 <= wr <= 0.8)]
+    for split_name, wr in bad:
+        print(f"\nWARNING: {split_name} wrong rate {wr:.3f} outside [0.2, 0.8]")
+    if bad:
+        if args.smoke:
+            # The 0.5B smoke model is weak, so high wrong rates are expected.
+            # Only fail if a split has a single class (probe/AUROC can't run).
+            single_class = [s for s, wr in wrong_rates.items() if wr in (0.0, 1.0)]
+            if single_class:
+                print(f"\nERROR: single-class splits {single_class}. "
+                      "Increase the smoke sample sizes in step 1.")
+                sys.exit(1)
+            print("  --smoke: continuing despite wrong rates outside [0.2, 0.8].")
+        else:
             print("  Stopping — check label noise before proceeding.")
             sys.exit(1)
 
