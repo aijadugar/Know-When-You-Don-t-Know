@@ -63,6 +63,9 @@ with open(MOCK_DIR / "probe_meta.json", "w") as f:
 with open(RESULTS_DIR / "metrics.json", "w") as f:
     _json.dump(MOCK_METRICS, f)
 
+# Placeholder so app.py's existence check passes (joblib.load is mocked below)
+(MOCK_DIR / "probe.joblib").touch()
+
 # Mock joblib to return our mock probe
 import joblib
 original_load = joblib.load
