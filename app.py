@@ -152,9 +152,11 @@ if APP_MOCK:
             texts = a[0] if a else kw.get("text", [])
             if isinstance(texts, str):
                 texts = [texts]
+            n = len(texts)
+            seq_len = 3
             return {
-                "input_ids": torch.tensor([[0, 1, 2] + [0] * (5 - len(t) % 5)])[:len(texts)],
-                "attention_mask": torch.ones(len(texts), 10),
+                "input_ids": torch.ones(n, seq_len, dtype=torch.long),
+                "attention_mask": torch.ones(n, seq_len, dtype=torch.long),
             }
 
     tokenizer = FakeTokenizer()
