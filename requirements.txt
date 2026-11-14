@@ -2,13 +2,15 @@
 # Note: PyTorch 2.8.0-2.13.0 specified in ZeroGPU docs not yet released.
 # Using latest available (2.5.0) — app works, README notes the deviation.
 gradio==4.44.0
-spaces==0.0.18
+spaces
 torch==2.5.0
 transformers==4.45.0
 scikit-learn==1.5.2
 joblib==1.4.2
 numpy==1.26.4
 huggingface_hub==0.25.2
-datasets>=2.18.0
+datasets==2.21.0
+pyarrow==17.0.0
 matplotlib>=3.8.0
 tqdm>=4.66.0
+accelerate>=0.26.0
